@@ -81,7 +81,7 @@ void printSystem(FILE* handle){
 		for (j=0;j<3;j++){
 			fprintf(handle,"%lf,",hPos[i][j]);
 		}
-		printf("),v=(");
+		fprintf(handle,"),v=(");
 		for (j=0;j<3;j++){
 			fprintf(handle,"%lf,",hVel[i][j]);
 		}
@@ -112,4 +112,5 @@ int main(int argc, char **argv)
 	printf("This took a total time of %f seconds\n",(double)t1/CLOCKS_PER_SEC);
 
 	freeHostMemory();
+	return 0;
 }
