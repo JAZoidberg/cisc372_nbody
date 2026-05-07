@@ -6,6 +6,9 @@
 #include "vector.h"
 #include "config.h"
 
+#define TILE_SIZE 16
+
+// Simple CUDA error checker.
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
         cudaError_t err = call;                                               \
@@ -16,19 +19,43 @@
         }                                                                    \
     } while (0)
 
-__global__ void computePairwiseAccelerations(vector3 *dPos,
-                                             double *dMass,
-                                             vector3 *dAccels) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int totalPairs = NUMENTITIES * NUMENTITIES;
 
-    if (index >= totalPairs) {
-        return;
+__global__ void computePairwiseAccelerationsTiled(vector3 *dPos,
+                                                  double *dMass,
+                                                  vector3 *dAccels) {
+    int localCol = threadIdx.x;
+    int localRow = threadIdx.y;
+
+    int j = blockIdx.x * TILE_SIZE + localCol; // source body
+    int i = blockIdx.y * TILE_SIZE + localRow; // target body
+
+    __shared__ double sourcePos[TILE_SIZE][3];
+    __shared__ double targetPos[TILE_SIZE][3];
+    __shared__ double sourceMass[TILE_SIZE];
+
+    // Load source body data into shared memory.
+    // One row of threads loads the source bodies for this tile.
+    if (localRow == 0 && j < NUMENTITIES) {
+        sourcePos[localCol][0] = dPos[j][0];
+        sourcePos[localCol][1] = dPos[j][1];
+        sourcePos[localCol][2] = dPos[j][2];
+        sourceMass[localCol] = dMass[j];
     }
 
-    int i = index / NUMENTITIES;
-    int j = index % NUMENTITIES;
+    // Load target body data into shared memory.
+    // One column of threads loads the target bodies for this tile.
+    if (localCol == 0 && i < NUMENTITIES) {
+        targetPos[localRow][0] = dPos[i][0];
+        targetPos[localRow][1] = dPos[i][1];
+        targetPos[localRow][2] = dPos[i][2];
+    }
+
+    __syncthreads();
+
+    if (i >= NUMENTITIES || j >= NUMENTITIES) {
+        return;
+    }
 
     int accelIndex = i * NUMENTITIES + j;
 
@@ -39,24 +66,26 @@ __global__ void computePairwiseAccelerations(vector3 *dPos,
         return;
     }
 
-    double distance[3];
+    double dx = targetPos[localRow][0] - sourcePos[localCol][0];
+    double dy = targetPos[localRow][1] - sourcePos[localCol][1];
+    double dz = targetPos[localRow][2] - sourcePos[localCol][2];
 
-    distance[0] = dPos[i][0] - dPos[j][0];
-    distance[1] = dPos[i][1] - dPos[j][1];
-    distance[2] = dPos[i][2] - dPos[j][2];
+    double magnitude_sq = dx * dx + dy * dy + dz * dz;
 
-    double magnitude_sq =
-        distance[0] * distance[0] +
-        distance[1] * distance[1] +
-        distance[2] * distance[2];
+    // Safety check against divide-by-zero if two bodies ever occupy the same position.
+    if (magnitude_sq == 0.0) {
+        dAccels[accelIndex][0] = 0.0;
+        dAccels[accelIndex][1] = 0.0;
+        dAccels[accelIndex][2] = 0.0;
+        return;
+    }
 
     double magnitude = sqrt(magnitude_sq);
+    double accelmag = -1.0 * GRAV_CONSTANT * sourceMass[localCol] / magnitude_sq;
 
-    double accelmag = -1.0 * GRAV_CONSTANT * dMass[j] / magnitude_sq;
-
-    dAccels[accelIndex][0] = accelmag * distance[0] / magnitude;
-    dAccels[accelIndex][1] = accelmag * distance[1] / magnitude;
-    dAccels[accelIndex][2] = accelmag * distance[2] / magnitude;
+    dAccels[accelIndex][0] = accelmag * dx / magnitude;
+    dAccels[accelIndex][1] = accelmag * dy / magnitude;
+    dAccels[accelIndex][2] = accelmag * dz / magnitude;
 }
 
 __global__ void updateBodies(vector3 *dPos,
@@ -106,16 +135,16 @@ extern "C" void compute() {
     CUDA_CHECK(cudaMemcpy(dVel, hVel, vectorArraySize, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dMass, mass, massArraySize, cudaMemcpyHostToDevice));
 
-    int threadsPerBlock = 256;
+    dim3 pairThreads(TILE_SIZE, TILE_SIZE);
+    dim3 pairBlocks((NUMENTITIES + TILE_SIZE - 1) / TILE_SIZE,
+                    (NUMENTITIES + TILE_SIZE - 1) / TILE_SIZE);
 
-    int totalPairs = NUMENTITIES * NUMENTITIES;
-    int pairBlocks = (totalPairs + threadsPerBlock - 1) / threadsPerBlock;
-
-    int bodyBlocks = (NUMENTITIES + threadsPerBlock - 1) / threadsPerBlock;
-
-    computePairwiseAccelerations<<<pairBlocks, threadsPerBlock>>>(dPos, dMass, dAccels);
+    computePairwiseAccelerationsTiled<<<pairBlocks, pairThreads>>>(dPos, dMass, dAccels);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    int threadsPerBlock = 256;
+    int bodyBlocks = (NUMENTITIES + threadsPerBlock - 1) / threadsPerBlock;
 
     updateBodies<<<bodyBlocks, threadsPerBlock>>>(dPos, dVel, dAccels);
     CUDA_CHECK(cudaGetLastError());
